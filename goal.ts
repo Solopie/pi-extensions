@@ -459,15 +459,17 @@ export default function (pi: ExtensionAPI) {
 	let modelRuntime: ModelRuntime | null = null;
 	let ticker: ReturnType<typeof setInterval> | null = null;
 
-	// Set by agent_end when the user hit Esc; consumed by agent_settled.
-	// AgentSettledEvent carries no payload, so the abort has to be captured
-	// from the run that produced it.
+	// Final session-level outcome, captured at agent_before_settle and consumed
+	// by agent_settled. A single session-level run may contain several low-level
+	// agent_end events when Pi recovers from overflow or a transport failure, so
+	// an intermediate failed attempt must never pause an eventually successful
+	// goal run.
 	let runAborted = false;
-
-	// Same idea for a run that died on an API/transport failure (offline, 5xx,
-	// auth). The turn produced no real work, so auditing it is meaningless: the
-	// auditor is a sub-agent on the same connection and would just fail too.
 	let runError: string | null = null;
+
+	// Error from only the newest low-level attempt. A later successful recovery
+	// clears it before agent_before_settle commits the final outcome.
+	let latestAgentError: string | null = null;
 
 	// The model's own claim of completion. Not trusted - it only sharpens the
 	// auditor's prompt.
@@ -760,6 +762,8 @@ export default function (pi: ExtensionAPI) {
 		await getModelRuntime();
 		const goal = loadGoal(ctx);
 		runAborted = false;
+		runError = null;
+		latestAgentError = null;
 		claimedComplete = false;
 		goalIsActive = goal?.status === "active";
 		// Restart survives because state lives in session entries - re-register
@@ -773,6 +777,9 @@ export default function (pi: ExtensionAPI) {
 		cancelAudit = null;
 		auditing = false;
 		pendingObjective = null;
+		runAborted = false;
+		runError = null;
+		latestAgentError = null;
 		clearIndicator(ctx);
 	});
 
@@ -866,30 +873,30 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
-	// -- abort capture --------------------------------------------------------
+	// -- final run outcome ----------------------------------------------------
 
 	/**
-	 * Esc detection. An aborted run leaves an assistant message with
-	 * stopReason "aborted" - a real StopReason value, and a far more reliable
-	 * signal than inspecting ctx.signal, which cannot distinguish a user abort
-	 * from a system one.
+	 * agent_end is only a low-level attempt boundary. Pi may recover afterward
+	 * (the exact failure seen in the reported session was followed by a
+	 * context_edit and a successful continuation), so replace rather than latch
+	 * the latest attempt's error.
 	 */
 	pi.on("agent_end", async (event) => {
-		if (
-			event.messages.some(
-				(m: any) => m?.role === "assistant" && m.stopReason === "aborted",
-			)
-		) {
-			runAborted = true;
-		}
-		// stopReason "error" is what the runtime lands on once its own retries are
-		// exhausted - e.g. three failed connection attempts with the network down.
 		const failed = event.messages.find(
 			(m: any) => m?.role === "assistant" && m.stopReason === "error",
 		) as any;
-		if (failed) {
-			runError = String(failed.errorMessage ?? "the model request failed");
-		}
+		latestAgentError = failed
+			? String(failed.errorMessage ?? "the model request failed")
+			: null;
+	});
+
+	/** agent_before_settle is the first boundary with the final activity outcome. */
+	pi.on("agent_before_settle", async (event) => {
+		runAborted = event.outcome === "aborted";
+		runError = event.outcome === "error"
+			? (latestAgentError ?? "the model request failed")
+			: null;
+		latestAgentError = null;
 	});
 
 	// -- the loop -------------------------------------------------------------

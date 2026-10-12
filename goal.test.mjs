@@ -99,6 +99,32 @@ test('coach failure falls back to encouragement without stopping the goal', asyn
   await h.events.session_shutdown({}, h.ctx);
 });
 
+test('recovered low-level provider error does not pause the goal', async () => {
+  calls.length = 0;
+  responses = [{met:false, evidence:'More work remains', next:'Continue'}];
+  const h = harness();
+  await h.command('Fix tests');
+  await h.events.agent_end({messages:[{role:'assistant', stopReason:'error', errorMessage:'WebSocket closed 1012'}]}, h.ctx);
+  await h.events.agent_end({messages:[{role:'assistant', stopReason:'stop'}]}, h.ctx);
+  await h.events.agent_before_settle({outcome:'completed'}, h.ctx);
+  await h.events.agent_settled({}, h.ctx);
+  assert.equal(h.goal().status, 'active');
+  assert.equal(h.goal().turns, 1);
+  assert.equal(calls.length, 1);
+  await h.events.session_shutdown({}, h.ctx);
+});
+
+test('final provider error still pauses the goal without auditing', async () => {
+  calls.length = 0;
+  const h = harness();
+  await h.command('Fix tests');
+  await h.events.agent_end({messages:[{role:'assistant', stopReason:'error', errorMessage:'offline'}]}, h.ctx);
+  await h.events.agent_before_settle({outcome:'error'}, h.ctx);
+  await h.events.agent_settled({}, h.ctx);
+  assert.equal(h.goal().status, 'paused');
+  assert.equal(calls.length, 0);
+  await h.events.session_shutdown({}, h.ctx);
+});
 
 test('statusline shows mode and immediately updates toggles, including paused goals', async () => {
   const h = harness();
