@@ -140,3 +140,81 @@ test('statusline shows mode and immediately updates toggles, including paused go
   assert.match(h.statuses.at(-1), /active.*cheerleader off/);
   await h.events.session_shutdown({}, h.ctx);
 });
+
+test('Esc during tool execution pauses without auditing and resume still works', async () => {
+  calls.length = 0;
+  responses = [{met:true, evidence:'Tests pass', next:''}];
+  const h = harness();
+  try {
+    await h.command('Fix tests');
+    // The model already requested a tool; Esc does not produce an aborted
+    // assistant message. Pi reports the cancellation when the run settles.
+    await h.events.agent_end({messages:[{role:'assistant', stopReason:'toolUse'}]}, h.ctx);
+    await h.events.agent_settled({aborted:true}, h.ctx);
+    assert.equal(h.goal().status, 'paused');
+    assert.equal(h.goal().turns, 0);
+    assert.match(h.statuses.at(-1), /paused/);
+    assert.equal(calls.length, 0);
+    assert.equal(h.messages.length, 0);
+
+    await h.command('resume');
+    await h.events.agent_end({messages:[{role:'assistant', stopReason:'stop'}]}, h.ctx);
+    await h.events.agent_settled({aborted:false}, h.ctx);
+    assert.equal(h.goal().status, 'achieved');
+    assert.equal(calls.length, 1);
+  } finally {
+    await h.events.session_shutdown({}, h.ctx);
+  }
+});
+
+test('older runtimes still pause on an aborted assistant message', async () => {
+  calls.length = 0;
+  const h = harness();
+  try {
+    await h.command('Fix tests');
+    await h.events.agent_end({messages:[{role:'assistant', stopReason:'aborted'}]}, h.ctx);
+    await h.events.agent_settled({}, h.ctx);
+    assert.equal(h.goal().status, 'paused');
+    assert.equal(calls.length, 0);
+  } finally {
+    await h.events.session_shutdown({}, h.ctx);
+  }
+});
+
+test('Esc discards a queued goal instead of starting it', async () => {
+  calls.length = 0;
+  const h = harness();
+  try {
+    h.ctx.isIdle = () => false;
+    await h.command('Fix tests');
+    assert.equal(h.goal(), undefined);
+    h.ctx.isIdle = () => true;
+    await h.events.agent_settled({aborted:true}, h.ctx);
+    await h.events.agent_settled({aborted:false}, h.ctx);
+    assert.equal(h.goal(), undefined);
+    assert.equal(calls.length, 0);
+    assert.equal(h.messages.length, 0);
+  } finally {
+    await h.events.session_shutdown({}, h.ctx);
+  }
+});
+
+test('a successful final outcome overrides an intermediate aborted attempt', async () => {
+  for (const settled of [{}, {aborted:false}]) {
+    calls.length = 0;
+    responses = [{met:true, evidence:'Tests pass', next:''}];
+    const h = harness();
+    try {
+      await h.command('Fix tests');
+      await h.events.agent_end({messages:[{role:'assistant', stopReason:'aborted'}]}, h.ctx);
+      if (settled.aborted === undefined) {
+        await h.events.agent_before_settle({outcome:'completed'}, h.ctx);
+      }
+      await h.events.agent_settled(settled, h.ctx);
+      assert.equal(h.goal().status, 'achieved');
+      assert.equal(calls.length, 1);
+    } finally {
+      await h.events.session_shutdown({}, h.ctx);
+    }
+  }
+});

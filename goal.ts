@@ -460,10 +460,10 @@ export default function (pi: ExtensionAPI) {
 	let ticker: ReturnType<typeof setInterval> | null = null;
 
 	// Final session-level outcome, captured at agent_before_settle and consumed
-	// by agent_settled. A single session-level run may contain several low-level
-	// agent_end events when Pi recovers from overflow or a transport failure, so
-	// an intermediate failed attempt must never pause an eventually successful
-	// goal run.
+	// by agent_settled. The settled aborted flag also covers Esc during tools
+	// or retries, when no aborted assistant message was produced. Low-level
+	// agent_end abort capture is only a fallback for older Pi runtimes;
+	// intermediate failures must not pause an eventually successful run.
 	let runAborted = false;
 	let runError: string | null = null;
 
@@ -879,9 +879,13 @@ export default function (pi: ExtensionAPI) {
 	 * agent_end is only a low-level attempt boundary. Pi may recover afterward
 	 * (the exact failure seen in the reported session was followed by a
 	 * context_edit and a successful continuation), so replace rather than latch
-	 * the latest attempt's error.
+	 * the latest attempt's error and legacy abort signal. Session-level outcome
+	 * events override the abort fallback.
 	 */
 	pi.on("agent_end", async (event) => {
+		runAborted = event.messages.some(
+			(m: any) => m?.role === "assistant" && m.stopReason === "aborted",
+		);
 		const failed = event.messages.find(
 			(m: any) => m?.role === "assistant" && m.stopReason === "error",
 		) as any;
@@ -901,8 +905,12 @@ export default function (pi: ExtensionAPI) {
 
 	// -- the loop -------------------------------------------------------------
 
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("agent_settled", async (event, ctx) => {
 		if (auditing) return;
+
+		// Session-level cancellation is authoritative; message stop reasons alone
+		// miss Esc after the model has already handed off to a tool.
+		if (typeof event.aborted === "boolean") runAborted = event.aborted;
 
 		const goal = loadGoal(ctx);
 
