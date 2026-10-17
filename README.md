@@ -85,6 +85,8 @@ Starts work toward an objective and continues until an **independent auditor ses
 /goal cheerleader off
 ```
 
+Press **Escape** during an audit (or cheerleader coaching) to cancel it and pause the goal. Use `/goal resume` to continue later. `/goal pause` also cancels without discarding the objective; `/goal clear` cancels and clears it.
+
 Bare `/goal` shows status. Setting a goal normally starts work immediately; a new goal set during an unrelated active run is queued until that run finishes. Replacing an active goal asks for confirmation.
 
 The auditor uses the parent's model and thinking level, with `read`, `grep`, `find`, `ls`, and **bash** tools. It can run tests and commands, so auditing is not a sandbox or strictly read-only. Failed audits trigger further work; optional cheerleader mode adds context-aware coaching after a failed audit.
@@ -157,3 +159,11 @@ node --test goal.test.mjs
 ```
 
 These mock model/session calls and do not make live model requests. The BTW tests locate the installed Pi runtime through `pi` on `PATH` and use its bundled Jiti loader. The goal tests require a recent Node version with `node:module`'s `stripTypeScriptTypes` support. The other extensions do not currently have dedicated test files.
+
+### Goal controls in Pi Remote
+
+The Goal extension provides the optional version-1 `pi-goal:remote:v1` event bridge for Pi Remote. With both extensions updated and loaded, Remote shows Goal controls; without this extension, no controls are advertised. The bridge reuses the same goal command implementation, audit cancellation, persistence and pending-goal activation as `/goal`. It supports structured Start/Edit/Pause/Resume/Clear actions with revision checks, without terminal confirmation prompts or interpreting objective text as a command.
+
+`/goal edit <objective>` also edits locally. An active edit replaces the goal and resets audit progress; a paused edit remains paused. Pause and Clear stop the goal loop/auditor, not an already running parent turn. The Remote panel shows goal/audit status and preserves drafts; concurrent goal changes require reviewing the latest state before overwriting. Run `/remote off`, `/reload`, `/remote` on an updated host, then reopen its session in Remote.
+
+The optional version-1 `pi-remote:queue-pending:v1` handshake lets Remote-owned editable follow-ups take priority over autonomous Goal audits and continuations. Goal skips that settlement boundary while Remote has unpaused queued work; it resumes ordinary auditing after those user messages finish. With Remote absent, this changes nothing. Update/reload both extensions to use this priority behavior.

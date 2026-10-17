@@ -30,7 +30,7 @@ import {
 	SessionManager,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
@@ -333,7 +333,7 @@ async function runAudit(
 	modelRuntime: ModelRuntime,
 	objective: string,
 	claimed: boolean,
-	onCancel: (abort: () => void) => void,
+	signal: AbortSignal,
 	coaching?: Verdict,
 ): Promise<Verdict> {
 	// noExtensions is load-bearing: without it the sub-session loads THIS
@@ -348,7 +348,9 @@ async function runAudit(
 		noThemes: true,
 		systemPromptOverride: () => coaching ? CHEERLEADER_SYSTEM_PROMPT : AUDITOR_SYSTEM_PROMPT,
 	});
+	signal.throwIfAborted();
 	await loader.reload();
+	signal.throwIfAborted();
 
 	const { session } = await createAgentSession({
 		cwd: ctx.cwd,
@@ -397,13 +399,20 @@ async function runAudit(
 		timedOut = true;
 		void session.abort();
 	}, AUDIT_TIMEOUT_MS);
-	onCancel(() => void session.abort());
+	const abort = () => { void session.abort(); };
+	signal.addEventListener("abort", abort, { once: true });
+	const checkStopped = () => {
+		signal.throwIfAborted();
+		if (timedOut) throw new Error(`auditor timed out after ${fmtDuration(AUDIT_TIMEOUT_MS)}`);
+	};
 
 	try {
+		checkStopped();
 		await session.prompt(coaching
 			? cheerleaderPrompt(objective, renderTranscript(ctx), coaching)
 			: auditorPrompt(objective, renderTranscript(ctx), claimed));
 
+		checkStopped();
 		let text = out.trim() || streamed.trim();
 		if (!text) {
 			if (timedOut) throw new Error(`auditor timed out after ${fmtDuration(AUDIT_TIMEOUT_MS)}`);
@@ -423,6 +432,7 @@ async function runAudit(
 					'ONLY the JSON object - no prose, no code fences: {"met": true|false, ' +
 					'"evidence": "...", "next": "..."}',
 			);
+			checkStopped();
 			text = out.trim() || streamed.trim();
 			if (!text) {
 				throw new Error(
@@ -438,6 +448,7 @@ async function runAudit(
 			next: String(parsed.next ?? ""),
 		};
 	} finally {
+		signal.removeEventListener("abort", abort);
 		clearTimeout(timeout);
 		unsubscribe();
 		session.dispose();
@@ -577,12 +588,12 @@ export default function (pi: ExtensionAPI) {
 			const held = queued.length > 0 ? ` · ${queued.length} queued` : "";
 			status(
 				ctx,
-				tint(`${spin} ${label} goal · ${modeLabel(shown.cheerleader)} · ${inPhase} · turn ${shown.turns}${held}`),
+				tint(`${spin} ${label} goal · ${modeLabel(shown.cheerleader)} · ${inPhase} · turn ${shown.turns}${held} · Esc to cancel`),
 			);
 			widget(ctx, [
 				tint(`${spin} ${label} goal — ${modeLabel(shown.cheerleader)} · ${inPhase}${held}`),
 				tint(`  ${objective}`),
-				dim(`  ${phase === "encouraging" ? "context-aware encouragement" : "independent verification with read+bash"} · /goal clear to abort`),
+				dim(`  ${phase === "encouraging" ? "context-aware encouragement" : "independent verification with read+bash"} · Esc to cancel · /goal pause`),
 			]);
 			return;
 		}
@@ -714,7 +725,7 @@ export default function (pi: ExtensionAPI) {
 			cheerleader,
 			status: "active",
 			turns: 0,
-			startedAt: Date.now(),
+			startedAt: Math.max(Date.now(), (loadGoal(ctx)?.startedAt ?? 0) + 1),
 		};
 		saveGoal(pi, fresh);
 		goalIsActive = true;
@@ -773,6 +784,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		if (auditing) auditCancelledByUser = true;
 		cancelAudit?.();
 		cancelAudit = null;
 		auditing = false;
@@ -903,6 +915,13 @@ export default function (pi: ExtensionAPI) {
 		latestAgentError = null;
 	});
 
+	function hasRemoteQueuedMessages(ctx: ExtensionContext) {
+		let waiting = false;
+		pi.events?.emit("pi-remote:queue-pending:v1", { version: 1, session: ctx.sessionManager.getSessionId?.(),
+			respond: (reply: any) => { if (reply?.version === 1) waiting = reply.pending === true; } });
+		return waiting;
+	}
+
 	// -- the loop -------------------------------------------------------------
 
 	pi.on("agent_settled", async (event, ctx) => {
@@ -913,6 +932,11 @@ export default function (pi: ExtensionAPI) {
 		if (typeof event.aborted === "boolean") runAborted = event.aborted;
 
 		const goal = loadGoal(ctx);
+
+		// Explicit Remote follow-ups outrank an autonomous audit/continuation.
+		// Without this optional handshake the parent is idle only while its Goal
+		// auditor runs, so an editable Remote-owned queue could otherwise starve.
+		if (hasRemoteQueuedMessages(ctx) && !runAborted && runError === null) return;
 
 		// A goal queued mid-run. Activated here rather than in the command so the
 		// run it was queued behind is never audited against it.
@@ -995,6 +1019,15 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		auditing = true;
+		const controller = new AbortController();
+		cancelAudit = () => controller.abort();
+		// The parent is idle during audits, so its normal Escape handler cannot
+		// stop this separate session. Consume Escape only while we own an audit.
+		const removeInput = ctx.hasUI ? ctx.ui.onTerminalInput((data) => {
+			if (!matchesKey(data, "escape")) return;
+			void goalCommand("pause", ctx);
+			return { consume: true };
+		}) : undefined;
 		showAuditing(ctx, goal);
 
 		try {
@@ -1010,9 +1043,7 @@ export default function (pi: ExtensionAPI) {
 			const claimed = claimedComplete;
 			claimedComplete = false;
 
-			const verdict = await runAudit(ctx, runtime, goal.objective, claimed, (abort) => {
-				cancelAudit = abort;
-			});
+			const verdict = await runAudit(ctx, runtime, goal.objective, claimed, controller.signal);
 			if (verdict.evidence.length > MAX_EVIDENCE_CHARS) {
 				verdict.evidence = `${verdict.evidence.slice(0, MAX_EVIDENCE_CHARS)}…[truncated]`;
 			}
@@ -1037,13 +1068,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			let encouragement = "";
-			if (current.cheerleader && queued.length === 0) {
+			if (current.cheerleader && queued.length === 0 && !hasRemoteQueuedMessages(ctx)) {
 				phase = "encouraging";
 				phaseStart = Date.now();
 				paint(ctx);
 				try {
 					const feedback = await runAudit(ctx, runtime, current.objective, false,
-						(abort) => { cancelAudit = abort; }, verdict);
+						controller.signal, verdict);
 					encouragement = feedback.next.slice(0, MAX_EVIDENCE_CHARS);
 				} catch {
 					// Coaching is optional; retain the verified next step if it fails.
@@ -1059,7 +1090,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Your message outranks the continuation. The goal is still active,
 			// so the turn it produces gets audited in the normal way.
-			if (queued.length > 0) return;
+			if (queued.length > 0 || hasRemoteQueuedMessages(ctx)) return;
 
 			// While idle, deliverAs is ignored and triggerTurn is what starts the
 			// turn. sendMessage returns void, so this does not deadlock the
@@ -1104,6 +1135,7 @@ export default function (pi: ExtensionAPI) {
 				if (current?.status === "active") saveGoal(pi, { ...current, status: "paused" });
 			}
 		} finally {
+			removeInput?.();
 			cancelAudit = null;
 			auditing = false;
 			auditCancelledByUser = false;
@@ -1115,18 +1147,16 @@ export default function (pi: ExtensionAPI) {
 
 	// -- /goal ----------------------------------------------------------------
 
-	pi.registerCommand("goal", {
-		description: "Set an objective Pi works toward until an auditor confirms it",
-		getArgumentCompletions: (prefix: string) => {
-			const items = ["status", "pause", "resume", "clear", "cheerleader on", "cheerleader off", "--cheerleader"]
-				.filter((s) => s.startsWith(prefix))
-				.map((v) => ({ value: v, label: v }));
-			return items.length > 0 ? items : null;
-		},
-		handler: async (args, ctx) => {
+	async function goalCommand(args: string, ctx: ExtensionContext, objectiveOnly = false, replaceConfirmed = false, objectiveCheerleader = false) {
 			let arg = (args ?? "").trim();
 			const goal = loadGoal(ctx);
 
+			if (!objectiveOnly) {
+			if (arg === "edit" || arg.startsWith("edit ")) {
+				try { await editGoal(ctx, arg.slice(5)); }
+				catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Goal edit failed.", "warning"); }
+				return;
+			}
 			if (arg === "cheerleader on" || arg === "cheerleader off") {
 				if (!goal || goal.status === "cleared" || goal.status === "achieved") {
 					ctx.ui.notify("Set a goal first: /goal --cheerleader <objective>", "warning");
@@ -1224,15 +1254,17 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			}
+
 			// New goal. Mode is per-goal and persists through resume/restart/fork.
-			const cheerleader = /^--cheerleader(?:\s|$)/.test(arg);
-			if (cheerleader) arg = arg.slice("--cheerleader".length).trim();
+			const cheerleader = objectiveOnly ? objectiveCheerleader : /^--cheerleader(?:\s|$)/.test(arg);
+			if (cheerleader && !objectiveOnly) arg = arg.slice("--cheerleader".length).trim();
 			if (!arg) {
 				ctx.ui.notify("Usage: /goal --cheerleader <objective>", "warning");
 				return;
 			}
 			if (goal?.status === "active") {
-				const ok = await ctx.ui.confirm("Replace goal?", `Currently: ${goal.objective}`);
+				const ok = replaceConfirmed || await ctx.ui.confirm("Replace goal?", `Currently: ${goal.objective}`);
 				if (!ok) return;
 				// An audit in flight belongs to the OLD objective, but the new goal is
 				// also "active", so the verdict's own status re-check would let it
@@ -1258,6 +1290,79 @@ export default function (pi: ExtensionAPI) {
 
 			// Setting a goal starts work immediately - no separate prompt needed.
 			startGoal(ctx, arg, cheerleader);
+	}
+
+	pi.registerCommand("goal", {
+		description: "Set an objective Pi works toward until an auditor confirms it",
+		getArgumentCompletions: (prefix: string) => {
+			const items = ["status", "edit", "pause", "resume", "clear", "cheerleader on", "cheerleader off", "--cheerleader"]
+				.filter((s) => s.startsWith(prefix))
+				.map((v) => ({ value: v, label: v }));
+			return items.length > 0 ? items : null;
 		},
+		handler: (args, ctx) => goalCommand(args, ctx),
+	});
+
+	async function editGoal(ctx: ExtensionContext, objective: string) {
+		objective = objective.trim();
+		if (!objective) throw new Error("Enter an objective.");
+		if (pendingObjective !== null) {
+			pendingObjective = objective;
+			showPending(ctx);
+			marker("queued", "Queued goal edited", objective);
+			return;
+		}
+		const goal = loadGoal(ctx);
+		if (!goal || !["active", "paused", "limited"].includes(goal.status)) throw new Error("No editable goal. Start a new goal first.");
+		if (goal.status === "active") {
+			// Reuse the same replacement/audit-cancellation path as /goal.
+			await goalCommand(objective, ctx, true, true, !!goal.cheerleader);
+		} else {
+			const updated = { ...goal, objective, turns: 0, startedAt: Math.max(Date.now(), goal.startedAt + 1), lastEvidence: undefined };
+			saveGoal(pi, updated);
+			marker("continuing", "Goal edited (still paused)", objective);
+			showIdle(ctx, updated);
+		}
+	}
+
+	// Optional in-process bridge. Only this extension owns goal mutation, audits,
+	// queued activation and persistence. No slash-command or UI-input emulation.
+	let remoteRevision = 0, remoteSignature = "", remoteChanging = false;
+	function remoteState(ctx: ExtensionContext) {
+		const goal = loadGoal(ctx);
+		const signature = JSON.stringify([ctx.sessionManager.getSessionId?.(), goal, pendingObjective, pendingCheerleader, auditing]);
+		if (signature !== remoteSignature) { remoteSignature = signature; remoteRevision++; }
+		const objective = pendingObjective ?? goal?.objective ?? "";
+		return { revision: remoteRevision, status: pendingObjective !== null ? "queued" : goal?.status ?? "none",
+			objective: objective.slice(0, 16000), objectiveTruncated: objective.length > 16000,
+			turns: pendingObjective !== null ? 0 : goal?.turns ?? 0, auditing, changing: remoteChanging };
+	}
+	pi.events?.on("pi-goal:remote:v1", (request: any) => {
+		if (!request || request.version !== 1 || typeof request.respond !== "function" || !request.context?.sessionManager) return;
+		const ctx: ExtensionContext = request.context;
+		const respond = (value: object) => request.respond({ version: 1, ...value });
+		if (request.action === "status") { respond({ ok: true, state: remoteState(ctx) }); return; }
+		void (async () => {
+			try {
+				const current = remoteState(ctx);
+				if (remoteChanging) throw new Error("Another goal change is in progress.");
+				if (request.revision !== current.revision) throw new Error("Goal changed on the host. Review its latest state and try again.");
+				if (!["start", "edit", "pause", "resume", "clear"].includes(request.action)) throw new Error("Unsupported goal action.");
+				if (["start", "edit"].includes(request.action) && (typeof request.objective !== "string" || !request.objective.trim() || request.objective.length > 16000)) throw new Error("Enter an objective of 1–16000 characters.");
+				if (request.action === "start" && !["none", "cleared", "achieved"].includes(current.status)) throw new Error("Edit or resume the current goal instead of starting another.");
+				if (request.action === "pause" && current.status !== "active") throw new Error("No active goal to pause.");
+				if (request.action === "resume" && !["paused", "limited"].includes(current.status)) throw new Error("No paused goal to resume.");
+				if (request.action === "clear" && ["none", "cleared"].includes(current.status)) throw new Error("No goal to clear.");
+				remoteChanging = true;
+				try {
+					if (request.action === "start") await goalCommand(request.objective, ctx, true);
+					else if (request.action === "edit") await editGoal(ctx, request.objective);
+					else await goalCommand(request.action, ctx);
+				} finally { remoteChanging = false; }
+				respond({ ok: true, state: remoteState(ctx) });
+			} catch (error) {
+				respond({ ok: false, error: error instanceof Error ? error.message.slice(0, 500) : "Goal command failed.", state: remoteState(ctx) });
+			}
+		})();
 	});
 }
